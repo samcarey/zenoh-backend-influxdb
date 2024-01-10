@@ -28,7 +28,7 @@ use zenoh::buffers::ZBuf;
 use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use zenoh::buffers::buffer::SplitBuffer;
 use zenoh::prelude::*;
@@ -588,32 +588,27 @@ impl Storage for InfluxDbStorage {
             base64: bool,
             value: String,
         }
-        #[allow(unused_assignments)]
-        let mut qs: String = String::new();
 
-        match time_from_parameters(parameters)? {
-            Some((start, stop)) => {
-                qs = format!(
-                    "from(bucket: \"{}\")
-                                            |> range(start: {}, stop: {})
-                                            |> filter(fn: (r) => r._measurement == \"{}\")
-                                            |> filter(fn: (r) => r[\"kind\"] == \"PUT\")
-                                        ",
-                    db, start, stop, measurement
-                );
-            }
-            None => {
-                qs = format!(
-                    "from(bucket: \"{}\")
-                                            |> range(start: {})
-                                            |> filter(fn: (r) => r._measurement == \"{}\")
-                                            |> filter(fn: (r) => r[\"kind\"] == \"PUT\")
-                                            |> last()
-                                        ",
-                    db, 0, measurement
-                );
-            }
-        }
+        let [start, stop] = time_from_parameters(parameters)?
+            .map(|d| d.map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)));
+        let start_parameter = format!("start: {}", start.as_ref().unwrap_or(&"0".to_string()));
+        let stop_parameter = stop
+            .as_ref()
+            .map(|stop| format!(", stop: {stop}"))
+            .unwrap_or_default();
+        let last_function = if let (None, None) = (start, stop) {
+            "|> last()"
+        } else {
+            ""
+        };
+        let qs = format!(
+            "from(bucket: \"{db}\")
+                |> range({start_parameter}{stop_parameter})
+                |> filter(fn: (r) => r._measurement == \"{measurement}\")
+                |> filter(fn: (r) => r[\"kind\"] == \"PUT\")
+                {last_function}
+            ",
+        );
 
         log::debug!(
             "Get {:?} with Influx query:{} in InfluxDBv2 storage",
@@ -832,51 +827,41 @@ fn key_exprs_to_influx_regex(path_exprs: &[&keyexpr]) -> String {
     result
 }
 
-fn time_from_parameters(t: &str) -> ZResult<Option<(f64, f64)>> {
+fn time_from_parameters(t: &str) -> ZResult<[Option<chrono::DateTime<Utc>>; 2]> {
     use zenoh::selector::{TimeBound, TimeRange};
     let time_range = t.time_range()?;
 
-    let mut start_time: f64 = 0_f64;
-    let mut stop_time: f64 = Utc::now().naive_utc().timestamp() as f64;
+    let mut start_time = None;
+    let mut stop_time = None;
 
-    match time_range {
-        Some(TimeRange(start, stop)) => {
-            match start {
-                TimeBound::Inclusive(t) => {
-                    start_time = calculate_time(t)?;
-                }
-                TimeBound::Exclusive(t) => {
-                    start_time = calculate_time(t)? + 1_f64;
-                }
-                TimeBound::Unbounded => {}
+    if let Some(TimeRange(start, stop)) = time_range {
+        match start {
+            TimeBound::Inclusive(t) => {
+                start_time = Some(calculate_time(t)?);
             }
-            match stop {
-                TimeBound::Inclusive(t) => {
-                    stop_time = calculate_time(t)? + 1_f64;
-                }
-                TimeBound::Exclusive(t) => {
-                    stop_time = calculate_time(t)?;
-                }
-                TimeBound::Unbounded => {}
+            TimeBound::Exclusive(t) => {
+                start_time = Some(calculate_time(t)? + chrono::Duration::milliseconds(1));
             }
+            TimeBound::Unbounded => {}
         }
-        None => {
-            return Ok(None);
+        match stop {
+            TimeBound::Inclusive(t) => {
+                stop_time = Some(calculate_time(t)? + chrono::Duration::milliseconds(1));
+            }
+            TimeBound::Exclusive(t) => {
+                stop_time = Some(calculate_time(t)?);
+            }
+            TimeBound::Unbounded => {}
         }
     }
-    Ok(Some((start_time, stop_time)))
+    Ok([start_time, stop_time])
 }
 
-fn calculate_time(tx: TimeExpr) -> ZResult<f64> {
-    let now_time = Utc::now().naive_utc().timestamp() as f64;
+fn calculate_time(tx: TimeExpr) -> ZResult<chrono::DateTime<Utc>> {
     match tx {
-        TimeExpr::Fixed(t) => {
-            let time_in_subsecs = t
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs_f64();
-            Ok(time_in_subsecs)
+        TimeExpr::Fixed(t) => Ok(chrono::DateTime::<Utc>::from(t)),
+        TimeExpr::Now { offset_secs } => {
+            Ok(Utc::now() + chrono::Duration::from_std(Duration::from_secs_f64(offset_secs))?)
         }
-        TimeExpr::Now { offset_secs } => Ok(now_time + offset_secs),
     }
 }
