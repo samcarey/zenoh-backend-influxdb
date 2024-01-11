@@ -861,7 +861,7 @@ fn calculate_time(tx: TimeExpr) -> ZResult<chrono::DateTime<Utc>> {
     match tx {
         TimeExpr::Fixed(t) => Ok(chrono::DateTime::<Utc>::from(t)),
         TimeExpr::Now { offset_secs } => {
-            Ok(Utc::now() + chrono::Duration::from_std(Duration::from_secs_f64(offset_secs))?)
+            Ok(Utc::now() + chrono::Duration::milliseconds((offset_secs * 1e3) as i64))
         }
     }
 }
